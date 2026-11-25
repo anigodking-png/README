@@ -1,5 +1,5 @@
 ﻿import React, { useEffect, useMemo, useState } from 'react';
-
+import { supabase } from './supabase';
 type Product = { id: string; name: string; sku: string; buy: number; sell: number; qty: number; low: number; unit: string };
 type Customer = { id: string; name: string; phone: string; balance: number };
 type Sale = { id: string; date: string; customer: string; customerId?: string; total: number; paid: number; method: string; items: string; pickupStatus?: 'pending' | 'taken' };
@@ -28,9 +28,10 @@ export default function App() {
   const [loaded, setLoaded] = useState(false);
   const [allowSave, setAllowSave] = useState(false);
   const [user, setUser] = useState<Employee | null>(null);
+const [businessId, setBusinessId] = useState('');
   const [page, setPage] = useState('Overview');
-  const [loginName, setLoginName] = useState('admin');
-  const [loginPin, setLoginPin] = useState('1234');
+  const [loginName, setLoginName] = useState('');
+  const [loginPin, setLoginPin] = useState('');
   const [message, setMessage] = useState('');
   const [productForm, setProductForm] = useState({ name: '', sku: '', buy: '', sell: '', qty: '', low: '5', unit: 'pcs' });
   const [customerForm, setCustomerForm] = useState({ name: '', phone: '' });
@@ -118,12 +119,41 @@ export default function App() {
   const expenseTotal = data.expenses.reduce((s, x) => s + x.amount, 0);
   const estimatedProfit = data.sales.reduce((sum, sale) => sum + Number(sale.total) * 0.2, 0) - expenseTotal;
 
-  function login(e: React.FormEvent) {
-    e.preventDefault();
-    const found = data.employees.find(x => x.username === loginName.trim() && x.pin === loginPin);
-    if (!found) { setMessage('Incorrect username or PIN.'); return; }
-    setUser(found); setMessage('Welcome to Yabei Hardware.');
+  async function login(e: React.FormEvent) {
+  e.preventDefault();
+  setMessage('Signing in...');
+
+  const { data: authData, error: authError } =
+    await supabase.auth.signInWithPassword({
+      email: loginName.trim(),
+      password: loginPin
+    });
+
+  if (authError || !authData.user) {
+    setMessage(authError?.message || 'Sign in failed.');
+    return;
   }
+
+  const { data: member, error: memberError } = await supabase
+    .from('business_members')
+    .select('business_id, role')
+    .eq('user_id', authData.user.id)
+    .maybeSingle();
+
+  if (memberError || !member) {
+    await supabase.auth.signOut();
+    setMessage('Your account is not linked to Yabei Hardware.');
+    return;
+  }
+    setBusinessId(member.business_id);
+  setUser({
+    username: authData.user.email || loginName.trim(),
+    pin: '',
+    role: member.role === 'owner' || member.role === 'admin' ? 'admin' : 'worker'
+  });
+
+  setMessage('Welcome to Yabei Hardware.');
+}
   function addProduct(e: React.FormEvent) {
     e.preventDefault();
     if (!productForm.name.trim()) return setMessage('Enter a product name.');
@@ -227,14 +257,27 @@ export default function App() {
   if (!user) return <main style={styles.loginWrap}>
     <form onSubmit={login} style={styles.login}>
       <div style={styles.logo}>YH</div><h1>YABEI HARDWARE</h1><p style={styles.muted}>Store management system</p>
-      <label>Username</label><input value={loginName} onChange={e => setLoginName(e.target.value)} />
-      <label>PIN</label><input type="password" value={loginPin} onChange={e => setLoginPin(e.target.value)} />
-      <button style={styles.primary}>Sign in</button>
-      <p style={styles.muted}>First-time demo login: admin / 1234</p>
+     <label>Email address</label>
+<input
+  type="email"
+  value={loginName}
+  onChange={e => setLoginName(e.target.value)}
+  placeholder="Enter your email"
+  required
+/>
+<label>Password</label>
+<input
+  type="password"
+  value={loginPin}
+  onChange={e => setLoginPin(e.target.value)}
+  placeholder="Enter your password"
+  required
+/>
+<button style={styles.primary}>Sign in</button>
       {message && <p>{message}</p>}
     </form>
   </main>;
-
+ 
   const nav = ['Overview', 'Stock', 'New Sale', 'Sales', 'Customers', 'Expenses', 'Reports', 'Employees', 'Settings'];
   return <div style={styles.app}>
     <header style={styles.header}><div><b>YABEI HARDWARE</b><small>Store management</small></div><div>{user.username} Â· {user.role}<button style={styles.logout} onClick={() => { setUser(null); setPage('Overview'); }}>Sign out</button></div></header>
