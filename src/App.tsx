@@ -16,7 +16,7 @@ function parseQty(raw: string): number {
   return Number(value);
 }
 const money = (n: number) => `KSh ${Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 2 })}`;
-const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const uid = () => crypto.randomUUID();
 const blankData = () => ({
   products: [] as Product[], customers: [] as Customer[], sales: [] as Sale[],
   expenses: [] as Expense[], employees: [{ username: 'admin', pin: '1234', role: 'admin' as const }] as Employee[]
@@ -47,65 +47,26 @@ const [businessId, setBusinessId] = useState('');
   const [salePaid, setSalePaid] = useState('');
   const [cart, setCart] = useState<{ productId: string; qty: string }[]>([]);
   const [employeeForm, setEmployeeForm] = useState({ username: '', pin: '', role: 'worker' as 'admin' | 'worker' });
-  useEffect(() => {
-    async function loadData() {
-      try {
-        const response = await fetch('http://127.0.0.1:3001/api/data');
-        if (!response.ok) throw new Error('Database unavailable');
-
-        const serverData = await response.json();
-
-        if (serverData) {
-          setData({ ...blankData(), ...serverData });
-        } else {
-          const saved = localStorage.getItem(KEY);
-          const initialData = saved
-            ? { ...blankData(), ...JSON.parse(saved) }
-            : blankData();
-
-          const saveResponse = await fetch('http://127.0.0.1:3001/api/data', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(initialData)
-          });
-
-          if (!saveResponse.ok) throw new Error('Data transfer failed');
-          setData(initialData);
-        }
-
-        setAllowSave(true);
-      } catch {
-        const saved = localStorage.getItem(KEY);
-        if (saved) {
-          try {
-            setData({ ...blankData(), ...JSON.parse(saved) });
-          } catch {
-            setMessage('Saved browser data could not be read.');
-          }
-        }
-        setMessage('Database connection failed. Check the server.');
-      } finally {
-        setLoaded(true);
-      }
+  
+useEffect(() => {
+  try {
+    const saved = localStorage.getItem(KEY);
+    if (saved) {
+      setData({ ...blankData(), ...JSON.parse(saved) });
     }
+  } catch {
+    setMessage('Saved browser data could not be read.');
+  } finally {
+    setLoaded(true);
+  }
+}, []);
 
-    loadData();
-  }, []);
+useEffect(() => {
+  if (!loaded) return;
 
-  useEffect(() => {
-    if (!loaded) return;
-
-    localStorage.setItem(KEY, JSON.stringify(data));
-    if (!allowSave) return;
-
-    fetch('http://127.0.0.1:3001/api/data', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
-    }).catch(() => {
-      setMessage('Database save failed. Check the server.');
-    });
-  }, [data, loaded, allowSave]);
+  localStorage.setItem(KEY, JSON.stringify(data));
+}, [data, loaded]);
+ 
   const isAdmin = user?.role === 'admin';
   const cartTotal = cart.reduce((sum, line) => {
     const p = data.products.find(x => x.id === line.productId);
@@ -142,27 +103,157 @@ const [businessId, setBusinessId] = useState('');
 
   if (memberError || !member) {
     await supabase.auth.signOut();
-    setMessage('Your account is not linked to Yabei Hardware.');
+    setMessage(memberError?.message || 'Your account is not linked to Yabei Hardware.');
     return;
   }
-    setBusinessId(member.business_id);
+
+  const business = member.business_id;
+
+  const [
+    { data: products, error: productsError },
+    { data: customers, error: customersError },
+    { data: sales, error: salesError },
+    { data: saleItems, error: itemsError },
+    { data: expenses, error: expensesError }
+  ] = await Promise.all([
+    supabase.from('products').select('*').eq('business_id', business),
+    supabase.from('customers').select('*').eq('business_id', business),
+    supabase.from('sales').select('*').eq('business_id', business),
+    supabase.from('sale_items').select('*').eq('business_id', business),
+    supabase.from('expenses').select('*').eq('business_id', business)
+  ]);
+
+  if (productsError || customersError || salesError || itemsError || expensesError) {
+    await supabase.auth.signOut();
+    setMessage(
+      productsError?.message ||
+      customersError?.message ||
+      salesError?.message ||
+      itemsError?.message ||
+      expensesError?.message ||
+      'Could not load business records.'
+    );
+    return;
+  }
+
+  const productList = (products || []).map(p => ({
+    id: p.id,
+    name: p.name,
+    sku: p.sku || '',
+    buy: Number(p.buying_price) || 0,
+    sell: Number(p.selling_price) || 0,
+    qty: Number(p.quantity) || 0,
+    low: Number(p.low_stock_level) || 0,
+    unit: p.unit || 'pcs'
+  }));
+
+  const customerList = (customers || []).map(c => ({
+    id: c.id,
+    name: c.name,
+    phone: c.phone || '',
+    balance: (sales || [])
+      .filter(s => s.customer_id === c.id)
+      .reduce(
+        (total, s) => total + Math.max(
+          0,
+          Number(s.total_amount || 0) - Number(s.amount_paid || 0)
+        ),
+        0
+      )
+  }));
+
+  const productNames = new Map(productList.map(p => [p.id, p.name]));
+
+  const saleList = (sales || []).map(s => ({
+    id: s.id,
+    date: s.created_at,
+    customer: customerList.find(c => c.id === s.customer_id)?.name || 'Walk-in customer',
+    customerId: s.customer_id || undefined,
+    total: Number(s.total_amount) || 0,
+    paid: Number(s.amount_paid) || 0,
+    method: s.payment_method || 'Cash',
+    items: (saleItems || [])
+      .filter(i => i.sale_id === s.id)
+      .map(i => `${productNames.get(i.product_id) || 'Product'} × ${i.quantity}`)
+      .join(', '),
+    pickupStatus: s.pickup_status === 'taken' ? 'taken' as const : 'pending' as const
+  }));
+
+  const expenseList = (expenses || []).map(x => ({
+    id: x.id,
+    date: x.created_at,
+    description: x.description,
+    amount: Number(x.amount) || 0
+  }));
+
+  setData({
+    products: productList,
+    customers: customerList,
+    sales: saleList,
+    expenses: expenseList,
+    employees: []
+  });
+
+  setBusinessId(business);
+
   setUser({
     username: authData.user.email || loginName.trim(),
     pin: '',
     role: member.role === 'owner' || member.role === 'admin' ? 'admin' : 'worker'
   });
 
-  setMessage('Welcome to Yabei Hardware.');
+  setMessage('Welcome to Yabei Hardware. Cloud records loaded.');
 }
-  function addProduct(e: React.FormEvent) {
+
+  async function addProduct(e: React.FormEvent) {
     e.preventDefault();
-    if (!productForm.name.trim()) return setMessage('Enter a product name.');
-    setData(d => ({ ...d, products: [...d.products, {
-      id: uid(), name: productForm.name.trim(), sku: productForm.sku.trim(),
-      buy: Number(productForm.buy) || 0, sell: Number(productForm.sell) || 0,
-      qty: Number(productForm.qty) || 0, low: Number(productForm.low) || 0, unit: productForm.unit || 'pcs'
-    }] }));
-    setProductForm({ name: '', sku: '', buy: '', sell: '', qty: '', low: '5', unit: 'pcs' }); setMessage('Product saved.');
+
+    if (!productForm.name.trim()) {
+      return setMessage('Enter a product name.');
+    }
+
+    if (!businessId) {
+      return setMessage('Please sign in again before saving products.');
+    }
+
+    setMessage('Saving product to Supabase...');
+
+    const { data: savedProduct, error } = await supabase
+      .from('products')
+      .insert({
+        business_id: businessId,
+        name: productForm.name.trim(),
+        sku: productForm.sku.trim(),
+        buying_price: Number(productForm.buy) || 0,
+        selling_price: Number(productForm.sell) || 0,
+        quantity: Number(productForm.qty) || 0,
+        low_stock_level: Number(productForm.low) || 0,
+        unit: productForm.unit || 'pcs'
+      })
+      .select()
+      .single();
+
+    if (error || !savedProduct) {
+      setMessage(error?.message || 'Product could not be saved.');
+      return;
+    }
+
+    setData(d => ({
+      ...d,
+      products: [...d.products, {
+        id: savedProduct.id,
+        name: savedProduct.name,
+        sku: savedProduct.sku || '',
+        buy: Number(savedProduct.buying_price) || 0,
+        sell: Number(savedProduct.selling_price) || 0,
+        qty: Number(savedProduct.quantity) || 0,
+        low: Number(savedProduct.low_stock_level) || 0,
+        unit: savedProduct.unit || 'pcs'
+      }]
+    }));
+
+    setProductForm({ name: '', sku: '', buy: '', sell: '', qty: '', low: '5', unit: 'pcs' });
+    setMessage('Product successfully saved to Supabase.');
   }
   function saveSale() {
     if (!cart.length) return setMessage('Add at least one item to the sale.');
@@ -368,4 +459,6 @@ const styles: Record<string, React.CSSProperties> = {
   list: { marginTop: 12 },
   footer: { textAlign: 'center', padding: 20, color: '#718078', fontSize: 12 }
 };
+
+
 
